@@ -95,9 +95,43 @@ LAST_LOCAL_FILE="$STATE_DIR/last-local-hash"
 LAST_INCOMING_FILE="$STATE_DIR/last-incoming-archive-hash"
 OUTGOING="$ICLOUD_DIR/to-${PEER_ID}.zip"
 INCOMING="$ICLOUD_DIR/to-${SELF_ID}.zip"
+LAST_SEEN_INCOMING_SIGNATURE=""
 
 log() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_DIR/agent.log"
+}
+
+rotate_log() {
+  local file="$1" size i
+  [[ -f "$file" ]] || return 0
+  size="$(/usr/bin/stat -f '%z' "$file" 2>/dev/null)" || return 0
+  (( size < 1048576 )) && return 0
+
+  /bin/rm -f "$file.3"
+  for i in 2 1; do
+    [[ -f "$file.$i" ]] && /bin/mv -f "$file.$i" "$file.$((i + 1))"
+  done
+  /bin/cp -p "$file" "$file.1" && : > "$file"
+}
+
+housekeeping() {
+  local file candidate modified now i
+  local -a backups
+
+  for file in agent.log stdout.log stderr.log; do
+    rotate_log "$LOG_DIR/$file"
+  done
+
+  backups=("$STATE_DIR"/backup-*(/omN))
+  for (( i = 21; i <= ${#backups}; ++i )); do
+    /bin/rm -rf "$backups[$i]"
+  done
+
+  now="$(/bin/date '+%s')"
+  for candidate in "$STATE_DIR"/incoming.*(N) "$STATE_DIR"/outgoing.*(N) "$SAVE_DIR"/.vcmi-async.*(N); do
+    modified="$(/usr/bin/stat -f '%m' "$candidate" 2>/dev/null)" || continue
+    (( now - modified > 86400 )) && /bin/rm -rf "$candidate"
+  done
 }
 
 notify_local() {
@@ -138,6 +172,20 @@ save_files() {
     -name "${SAVE_NAME}.vlgm1" -o \
     -name "${SAVE_NAME}" \
   \) -print | /usr/bin/sort
+}
+
+file_signature() {
+  /usr/bin/stat -f '%i:%m:%z' "$1" 2>/dev/null
+}
+
+save_signature() {
+  local files file
+  files="$(save_files)"
+  [[ -n "$files" ]] || return 1
+
+  while IFS= read -r file; do
+    /usr/bin/stat -f '%i:%m:%z:%N' "$file" 2>/dev/null || return 1
+  done <<< "$files"
 }
 
 bundle_hash() {
@@ -246,20 +294,32 @@ restore_backup() {
 
 import_incoming() {
   local archive_hash stable_hash final_hash old_hash staging install_staging
-  local backup imported_hash file relative_name found_expected
-  [[ -f "$INCOMING" ]] || return 0
+  local backup imported_hash file relative_name found_expected incoming_signature
+  if [[ ! -f "$INCOMING" ]]; then
+    LAST_SEEN_INCOMING_SIGNATURE=""
+    return 0
+  fi
+
+  incoming_signature="$(file_signature "$INCOMING")" || return 0
+  [[ "$incoming_signature" != "$LAST_SEEN_INCOMING_SIGNATURE" ]] || return 0
 
   archive_hash="$(/usr/bin/shasum -a 256 "$INCOMING" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
   [[ -n "$archive_hash" ]] || return 0
   old_hash="$(cat "$LAST_INCOMING_FILE" 2>/dev/null || true)"
-  [[ "$archive_hash" != "$old_hash" ]] || return 0
+  if [[ "$archive_hash" == "$old_hash" ]]; then
+    LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
+    return 0
+  fi
 
   # Перевіряємо, що весь архів, а не лише його розмір, уже стабільний.
   /bin/sleep "$STABILITY_SECONDS"
   stable_hash="$(/usr/bin/shasum -a 256 "$INCOMING" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
   [[ -n "$stable_hash" && "$stable_hash" == "$archive_hash" ]] || return 0
   archive_hash="$stable_hash"
-  /usr/bin/unzip -tqq "$INCOMING" >/dev/null 2>&1 || return 0
+  if ! /usr/bin/unzip -tqq "$INCOMING" >/dev/null 2>&1; then
+    LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
+    return 0
+  fi
 
   staging="$(/usr/bin/mktemp -d "$STATE_DIR/incoming.XXXXXX")" || return 1
   /usr/bin/ditto -x -k "$INCOMING" "$staging" || {
@@ -275,6 +335,7 @@ import_incoming() {
     if [[ "$relative_name" == "$file" || "$relative_name" == */* || ! -f "$file" || -L "$file" ]] ||
        ! is_expected_save_name "$relative_name"; then
       log "Вхідний ZIP містить недозволений об’єкт: $relative_name"
+      LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
       /bin/rm -rf "$staging"
       return 1
     fi
@@ -283,6 +344,7 @@ import_incoming() {
 
   if [[ "$found_expected" != "true" ]]; then
     log "Вхідний ZIP не містить сейва $SAVE_NAME"
+    LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
     /bin/rm -rf "$staging"
     return 1
   fi
@@ -357,12 +419,18 @@ import_incoming() {
 
   print -r -- "$archive_hash" > "$LAST_INCOMING_FILE"
   print -r -- "$imported_hash" > "$LAST_LOCAL_FILE"
+  LAST_SEEN_INCOMING_SIGNATURE="$(file_signature "$INCOMING" || print -r -- "$incoming_signature")"
 
   log "Вхідний сейв імпортовано"
   notify_local
 }
 
 main_loop() {
+  local current_hash previous_hash stable_hash
+  local current_signature handled_signature stable_signature
+  local loop_count=0
+
+  housekeeping
   log "Агент запущено. SAVE_DIR=$SAVE_DIR; ICLOUD_DIR=$ICLOUD_DIR"
 
   # Перший запуск: поточний локальний сейв стає базовим і не відправляється сам.
@@ -371,25 +439,36 @@ main_loop() {
     initial_hash="$(bundle_hash 2>/dev/null || true)"
     [[ -n "$initial_hash" ]] && print -r -- "$initial_hash" > "$LAST_LOCAL_FILE"
   fi
+  handled_signature="$(save_signature 2>/dev/null || true)"
 
   while true; do
     import_incoming
 
-    local current_hash previous_hash stable_hash
-    current_hash="$(bundle_hash 2>/dev/null || true)"
-    previous_hash="$(cat "$LAST_LOCAL_FILE" 2>/dev/null || true)"
+    current_signature="$(save_signature 2>/dev/null || true)"
+    if [[ "$current_signature" != "$handled_signature" ]]; then
+      current_hash="$(bundle_hash 2>/dev/null || true)"
+      previous_hash="$(cat "$LAST_LOCAL_FILE" 2>/dev/null || true)"
 
-    if [[ -n "$current_hash" && "$current_hash" != "$previous_hash" ]]; then
-      /bin/sleep "$STABILITY_SECONDS"
-      stable_hash="$(bundle_hash 2>/dev/null || true)"
+      if [[ -n "$current_hash" && "$current_hash" == "$previous_hash" ]]; then
+        handled_signature="$current_signature"
+      elif [[ -n "$current_hash" ]]; then
+        /bin/sleep "$STABILITY_SECONDS"
+        stable_signature="$(save_signature 2>/dev/null || true)"
+        stable_hash="$(bundle_hash 2>/dev/null || true)"
 
-      if [[ "$stable_hash" == "$current_hash" ]]; then
-        if package_and_send "$stable_hash"; then
-          print -r -- "$stable_hash" > "$LAST_LOCAL_FILE"
+        if [[ "$stable_signature" == "$current_signature" && "$stable_hash" == "$current_hash" ]]; then
+          if package_and_send "$stable_hash"; then
+            print -r -- "$stable_hash" > "$LAST_LOCAL_FILE"
+            handled_signature="$stable_signature"
+          fi
         fi
       fi
     fi
 
+    if (( ++loop_count >= 360 )); then
+      housekeeping
+      loop_count=0
+    fi
     /bin/sleep "$POLL_SECONDS"
   done
 }
