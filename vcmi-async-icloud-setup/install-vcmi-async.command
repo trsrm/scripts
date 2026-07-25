@@ -104,6 +104,41 @@ log() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_DIR/agent.log"
 }
 
+notify_user() {
+  /usr/bin/osascript - "$1" "$2" "$3" <<'APPLESCRIPT' >/dev/null 2>&1
+on run argv
+  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
+end run
+APPLESCRIPT
+}
+
+raise_alert() {
+  local key="$1" subtitle="$2" message="$3"
+  local marker="$STATE_DIR/alert-$key"
+  [[ -f "$marker" ]] && return 0
+
+  notify_user "VCMI Async — проблема" "$subtitle" "$message"
+  /usr/bin/touch "$marker"
+  log "ALERT[$key]: $subtitle — $message"
+}
+
+resolve_alerts() {
+  local subtitle="$1" message="$2" key recovered=false
+  shift 2
+
+  for key in "$@"; do
+    if [[ -f "$STATE_DIR/alert-$key" ]]; then
+      /bin/rm -f "$STATE_DIR/alert-$key"
+      recovered=true
+    fi
+  done
+
+  if [[ "$recovered" == "true" && -n "$message" ]]; then
+    notify_user "VCMI Async — відновлено" "$subtitle" "$message"
+    log "RECOVERED: $subtitle — $message"
+  fi
+}
+
 rotate_log() {
   local file="$1" size i
   [[ -f "$file" ]] || return 0
@@ -138,13 +173,10 @@ housekeeping() {
 }
 
 notify_local() {
-  /usr/bin/osascript - "$PEER_NAME" "$SAVE_NAME" <<'APPLESCRIPT' >/dev/null 2>&1
-on run argv
-  set peerName to item 1 of argv
-  set saveName to item 2 of argv
-  display notification "Сейв «" & saveName & "» уже завантажено. Можна відкривати VCMI." with title "Heroes 3 — твоя черга" subtitle peerName & " завершив хід"
-end run
-APPLESCRIPT
+  notify_user \
+    "Heroes 3 — твоя черга" \
+    "$PEER_NAME завершив хід" \
+    "Сейв «$SAVE_NAME» уже завантажено. Можна відкривати VCMI."
 }
 
 authorize_mail() {
@@ -162,10 +194,15 @@ APPLESCRIPT
     MAIL_READY=true
     /usr/bin/touch "$MAIL_AUTH_FILE"
     log "Доступ до Mail підтверджено"
+    resolve_alerts "Email знову працює" "Доступ до Mail підтверджено." email
   else
     MAIL_READY=false
     /bin/rm -f "$MAIL_AUTH_FILE"
     log "Немає доступу до Mail; email вимкнено до перезапуску агента"
+    raise_alert \
+      email \
+      "Email вимкнено" \
+      "Обмін сейвами через iCloud працює. Перезапусти агент, щоб повторити авторизацію Mail."
     return 1
   fi
 }
@@ -181,11 +218,35 @@ on run argv
   set bodyText to item 3 of argv
 
   tell application "Mail"
+    set senderAddress to ""
+    repeat with mailAccount in every account
+      if enabled of mailAccount then
+        set accountAddresses to email addresses of mailAccount
+        set smtpAccount to delivery account of mailAccount
+        if (count of accountAddresses) > 0 and smtpAccount is not missing value then
+          if enabled of smtpAccount then
+            set senderAddress to item 1 of accountAddresses
+            exit repeat
+          end if
+        end if
+      end if
+    end repeat
+
+    if senderAddress is "" then error "No enabled Mail account with an active SMTP server"
     set msg to make new outgoing message with properties {visible:false, subject:subjectText, content:bodyText & return}
-    tell msg
-      make new to recipient at end of to recipients with properties {address:recipientAddress}
-      send
-    end tell
+    try
+      set sender of msg to senderAddress
+      tell msg
+        make new to recipient at end of to recipients with properties {address:recipientAddress}
+      end tell
+      set sendSucceeded to send msg
+      if sendSucceeded is not true then error "Mail returned false while sending"
+    on error errorMessage number errorNumber
+      try
+        delete msg
+      end try
+      error errorMessage number errorNumber
+    end try
   end tell
 end run
 APPLESCRIPT
@@ -193,6 +254,10 @@ APPLESCRIPT
     MAIL_READY=false
     /bin/rm -f "$MAIL_AUTH_FILE"
     log "Mail повернув помилку; email вимкнено до перезапуску агента"
+    raise_alert \
+      email \
+      "Email не надіслано" \
+      "Обмін сейвами через iCloud працює. Повідом другого гравця вручну та перезапусти агент."
     return 1
   fi
 }
@@ -248,9 +313,13 @@ bundle_hash() {
 
 package_and_send() {
   local expected_hash="$1"
-  local staging tmpzip file copied_hash
-  staging="$(/usr/bin/mktemp -d "$STATE_DIR/outgoing.XXXXXX")" || return 1
+  local staging tmpzip file copied_hash email_status="disabled"
+  staging="$(/usr/bin/mktemp -d "$STATE_DIR/outgoing.XXXXXX")" || {
+    raise_alert outgoing "Хід ще не передано" "Не вдалося створити staging. Агент повторить спробу автоматично."
+    return 1
+  }
   tmpzip="$(/usr/bin/mktemp "$STATE_DIR/outgoing.XXXXXX.zip")" || {
+    raise_alert outgoing "Хід ще не передано" "Не вдалося створити тимчасовий ZIP. Агент повторить спробу автоматично."
     /bin/rm -rf "$staging"
     return 1
   }
@@ -259,6 +328,7 @@ package_and_send() {
     [[ -f "$file" ]] || continue
     /bin/cp -p "$file" "$staging/" || {
       log "Не вдалося підготувати сейв до відправлення: $file"
+      raise_alert outgoing "Хід ще не передано" "Не вдалося підготувати ZIP. Агент повторить спробу автоматично."
       /bin/rm -rf "$staging" "$tmpzip"
       return 1
     }
@@ -271,6 +341,7 @@ package_and_send() {
 
   if [[ -z "$(/usr/bin/find "$staging" -type f -maxdepth 1 -print -quit)" ]]; then
     log "Немає файлів сейва для відправлення"
+    raise_alert outgoing "Хід ще не передано" "Не знайдено файлів сейва «$SAVE_NAME»."
     /bin/rm -rf "$staging" "$tmpzip"
     return 1
   fi
@@ -284,6 +355,7 @@ package_and_send() {
 
   /usr/bin/ditto -c -k --norsrc "$staging" "$tmpzip" || {
     log "Помилка створення ZIP"
+    raise_alert outgoing "Хід ще не передано" "Не вдалося створити ZIP. Агент повторить спробу автоматично."
     /bin/rm -rf "$staging" "$tmpzip"
     return 1
   }
@@ -291,12 +363,14 @@ package_and_send() {
   # Атомарна заміна в межах спільної iCloud-папки.
   /bin/cp "$tmpzip" "${OUTGOING}.new" || {
     log "Не вдалося записати ZIP у iCloud: ${OUTGOING}.new"
+    raise_alert outgoing "Хід ще не передано" "Не вдалося записати сейв в iCloud. Агент повторює спробу автоматично."
     /bin/rm -f "${OUTGOING}.new"
     /bin/rm -rf "$staging" "$tmpzip"
     return 1
   }
   /bin/mv -f "${OUTGOING}.new" "$OUTGOING" || {
     log "Не вдалося опублікувати ZIP в iCloud: $OUTGOING"
+    raise_alert outgoing "Хід ще не передано" "Не вдалося опублікувати сейв в iCloud. Агент повторює спробу автоматично."
     /bin/rm -f "${OUTGOING}.new"
     /bin/rm -rf "$staging" "$tmpzip"
     return 1
@@ -304,10 +378,30 @@ package_and_send() {
 
   /bin/rm -rf "$staging" "$tmpzip"
   log "Сейв відправлено: $OUTGOING"
+  resolve_alerts "" "" outgoing
 
   # Даємо iCloud трохи часу почати завантаження, потім надсилаємо email.
   /bin/sleep 10
-  send_email || log "Mail не зміг надіслати email"
+  if [[ "$EMAIL_ENABLED" == "true" && -n "$PEER_EMAIL" ]]; then
+    if send_email; then
+      email_status="sent"
+    else
+      email_status="failed"
+      log "Mail не зміг надіслати email"
+    fi
+  fi
+
+  case "$email_status" in
+    sent)
+      notify_user "VCMI Async — хід передано" "$PEER_NAME отримає повідомлення" "Сейв синхронізовано через iCloud, email надіслано."
+      ;;
+    failed)
+      # send_mail_message уже показав дедуплікований alert.
+      ;;
+    *)
+      notify_user "VCMI Async — хід передано" "Сейв уже в iCloud" "Можна закривати Mac."
+      ;;
+  esac
 }
 
 is_expected_save_name() {
@@ -364,13 +458,18 @@ import_incoming() {
   [[ -n "$stable_hash" && "$stable_hash" == "$archive_hash" ]] || return 0
   archive_hash="$stable_hash"
   if ! /usr/bin/unzip -tqq "$INCOMING" >/dev/null 2>&1; then
+    raise_alert incoming "Новий сейв не імпортовано" "Вхідний ZIP пошкоджений або не завантажився повністю. Локальний сейв не змінено."
     LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
     return 0
   fi
 
-  staging="$(/usr/bin/mktemp -d "$STATE_DIR/incoming.XXXXXX")" || return 1
+  staging="$(/usr/bin/mktemp -d "$STATE_DIR/incoming.XXXXXX")" || {
+    raise_alert incoming "Новий сейв не імпортовано" "Не вдалося створити staging. Локальний сейв не змінено."
+    return 1
+  }
   /usr/bin/ditto -x -k "$INCOMING" "$staging" || {
     log "Не вдалося розпакувати вхідний сейв"
+    raise_alert incoming "Новий сейв не імпортовано" "Не вдалося розпакувати ZIP. Локальний сейв не змінено."
     /bin/rm -rf "$staging"
     return 1
   }
@@ -382,6 +481,7 @@ import_incoming() {
     if [[ "$relative_name" == "$file" || "$relative_name" == */* || ! -f "$file" || -L "$file" ]] ||
        ! is_expected_save_name "$relative_name"; then
       log "Вхідний ZIP містить недозволений об’єкт: $relative_name"
+      raise_alert incoming "Новий сейв не імпортовано" "ZIP містить неочікувані файли. Локальний сейв не змінено."
       LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
       /bin/rm -rf "$staging"
       return 1
@@ -391,6 +491,7 @@ import_incoming() {
 
   if [[ "$found_expected" != "true" ]]; then
     log "Вхідний ZIP не містить сейва $SAVE_NAME"
+    raise_alert incoming "Новий сейв не імпортовано" "ZIP не містить сейва «$SAVE_NAME». Локальний сейв не змінено."
     LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
     /bin/rm -rf "$staging"
     return 1
@@ -410,12 +511,14 @@ import_incoming() {
   # Спочатку готуємо повну нову копію на тому самому диску, що й SAVE_DIR.
   install_staging="$(/usr/bin/mktemp -d "$SAVE_DIR/.vcmi-async.XXXXXX")" || {
     log "Не вдалося створити staging у папці сейвів"
+    raise_alert import "Помилка імпорту сейва" "Не вдалося підготувати папку сейвів. Локальний сейв не змінено."
     /bin/rm -rf "$staging"
     return 1
   }
   while IFS= read -r -d '' file; do
     /bin/cp -p "$file" "$install_staging/" || {
       log "Не вдалося підготувати вхідний сейв: $file"
+      raise_alert import "Помилка імпорту сейва" "Не вдалося підготувати новий сейв. Локальний сейв не змінено."
       /bin/rm -rf "$staging" "$install_staging"
       return 1
     }
@@ -423,6 +526,7 @@ import_incoming() {
 
   backup="$(/usr/bin/mktemp -d "$STATE_DIR/backup-$(date '+%Y%m%d-%H%M%S').XXXXXX")" || {
     log "Не вдалося створити каталог backup"
+    raise_alert import "Помилка імпорту сейва" "Не вдалося створити backup. Локальний сейв не змінено."
     /bin/rm -rf "$staging" "$install_staging"
     return 1
   }
@@ -430,6 +534,7 @@ import_incoming() {
     [[ -f "$file" ]] || continue
     /bin/cp -p "$file" "$backup/" || {
       log "Не вдалося створити backup: $file"
+      raise_alert import "Помилка імпорту сейва" "Не вдалося створити backup. Локальний сейв не змінено."
       /bin/rm -rf "$staging" "$install_staging" "$backup"
       return 1
     }
@@ -442,7 +547,12 @@ import_incoming() {
     "$SAVE_DIR/${SAVE_NAME}.vlgm1" \
     "$SAVE_DIR/${SAVE_NAME}"; then
     log "Не вдалося прибрати попередню версію сейва"
-    restore_backup "$backup" || log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+    if restore_backup "$backup"; then
+      raise_alert import "Помилка імпорту сейва" "Попередній сейв відновлено. Новий сейв не імпортовано."
+    else
+      log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+      raise_alert critical "Критична помилка імпорту" "Не відкривай VCMI. Перевір logs/agent.log."
+    fi
     /bin/rm -rf "$staging" "$install_staging"
     return 1
   fi
@@ -450,7 +560,12 @@ import_incoming() {
   while IFS= read -r -d '' file; do
     if ! /bin/mv -f "$file" "$SAVE_DIR/"; then
       log "Не вдалося встановити вхідний сейв; відновлюємо backup"
-      restore_backup "$backup" || log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+      if restore_backup "$backup"; then
+        raise_alert import "Помилка імпорту сейва" "Попередній сейв відновлено. Новий сейв не імпортовано."
+      else
+        log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+        raise_alert critical "Критична помилка імпорту" "Не відкривай VCMI. Перевір logs/agent.log."
+      fi
       /bin/rm -rf "$staging" "$install_staging"
       return 1
     fi
@@ -460,7 +575,12 @@ import_incoming() {
   imported_hash="$(bundle_hash 2>/dev/null || true)"
   if [[ -z "$imported_hash" ]]; then
     log "Імпортований сейв не пройшов фінальну перевірку; відновлюємо backup"
-    restore_backup "$backup" || log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+    if restore_backup "$backup"; then
+      raise_alert import "Помилка імпорту сейва" "Фінальна перевірка не пройдена. Попередній сейв відновлено."
+    else
+      log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+      raise_alert critical "Критична помилка імпорту" "Не відкривай VCMI. Перевір logs/agent.log."
+    fi
     return 1
   fi
 
@@ -469,6 +589,7 @@ import_incoming() {
   LAST_SEEN_INCOMING_SIGNATURE="$(file_signature "$INCOMING" || print -r -- "$incoming_signature")"
 
   log "Вхідний сейв імпортовано"
+  resolve_alerts "" "" incoming import critical
   notify_local
 }
 
