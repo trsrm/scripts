@@ -152,7 +152,8 @@ bundle_hash() {
 }
 
 package_and_send() {
-  local staging tmpzip file
+  local expected_hash="$1"
+  local staging tmpzip file copied_hash
   staging="$(/usr/bin/mktemp -d "$STATE_DIR/outgoing.XXXXXX")" || return 1
   tmpzip="$(/usr/bin/mktemp "$STATE_DIR/outgoing.XXXXXX.zip")" || {
     /bin/rm -rf "$staging"
@@ -160,11 +161,28 @@ package_and_send() {
   }
 
   while IFS= read -r file; do
-    [[ -f "$file" ]] && /bin/cp -p "$file" "$staging/"
+    [[ -f "$file" ]] || continue
+    /bin/cp -p "$file" "$staging/" || {
+      log "Не вдалося підготувати сейв до відправлення: $file"
+      /bin/rm -rf "$staging" "$tmpzip"
+      return 1
+    }
+    /usr/bin/cmp -s "$file" "$staging/${file:t}" || {
+      log "Сейв змінився під час підготовки; відправлення буде повторено"
+      /bin/rm -rf "$staging" "$tmpzip"
+      return 1
+    }
   done <<< "$(save_files)"
 
   if [[ -z "$(/usr/bin/find "$staging" -type f -maxdepth 1 -print -quit)" ]]; then
     log "Немає файлів сейва для відправлення"
+    /bin/rm -rf "$staging" "$tmpzip"
+    return 1
+  fi
+
+  copied_hash="$(bundle_hash 2>/dev/null || true)"
+  if [[ "$copied_hash" != "$expected_hash" ]]; then
+    log "Сейв змінився під час пакування; відправлення буде повторено"
     /bin/rm -rf "$staging" "$tmpzip"
     return 1
   fi
@@ -176,8 +194,18 @@ package_and_send() {
   }
 
   # Атомарна заміна в межах спільної iCloud-папки.
-  /bin/cp "$tmpzip" "${OUTGOING}.new"
-  /bin/mv -f "${OUTGOING}.new" "$OUTGOING"
+  /bin/cp "$tmpzip" "${OUTGOING}.new" || {
+    log "Не вдалося записати ZIP у iCloud: ${OUTGOING}.new"
+    /bin/rm -f "${OUTGOING}.new"
+    /bin/rm -rf "$staging" "$tmpzip"
+    return 1
+  }
+  /bin/mv -f "${OUTGOING}.new" "$OUTGOING" || {
+    log "Не вдалося опублікувати ZIP в iCloud: $OUTGOING"
+    /bin/rm -f "${OUTGOING}.new"
+    /bin/rm -rf "$staging" "$tmpzip"
+    return 1
+  }
 
   /bin/rm -rf "$staging" "$tmpzip"
   log "Сейв відправлено: $OUTGOING"
@@ -187,8 +215,38 @@ package_and_send() {
   send_email || log "Mail не зміг надіслати email"
 }
 
+is_expected_save_name() {
+  case "$1" in
+    "$SAVE_NAME"|\
+    "${SAVE_NAME}.vcgm1"|\
+    "${SAVE_NAME}.vsgm1"|\
+    "${SAVE_NAME}.vlgm1")
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+restore_backup() {
+  local backup="$1"
+  local file
+
+  /bin/rm -f \
+    "$SAVE_DIR/${SAVE_NAME}.vcgm1" \
+    "$SAVE_DIR/${SAVE_NAME}.vsgm1" \
+    "$SAVE_DIR/${SAVE_NAME}.vlgm1" \
+    "$SAVE_DIR/${SAVE_NAME}"
+
+  while IFS= read -r -d '' file; do
+    /bin/cp -p "$file" "$SAVE_DIR/" || return 1
+  done < <(/usr/bin/find "$backup" -maxdepth 1 -type f -print0)
+}
+
 import_incoming() {
-  local archive_hash old_hash staging backup imported_hash
+  local archive_hash stable_hash final_hash old_hash staging install_staging
+  local backup imported_hash file relative_name found_expected
   [[ -f "$INCOMING" ]] || return 0
 
   archive_hash="$(/usr/bin/shasum -a 256 "$INCOMING" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
@@ -196,12 +254,11 @@ import_incoming() {
   old_hash="$(cat "$LAST_INCOMING_FILE" 2>/dev/null || true)"
   [[ "$archive_hash" != "$old_hash" ]] || return 0
 
-  # Перевіряємо, що файл уже стабільний і повністю доступний локально.
-  local size1 size2
-  size1="$(/usr/bin/stat -f '%z' "$INCOMING" 2>/dev/null || echo 0)"
+  # Перевіряємо, що весь архів, а не лише його розмір, уже стабільний.
   /bin/sleep "$STABILITY_SECONDS"
-  size2="$(/usr/bin/stat -f '%z' "$INCOMING" 2>/dev/null || echo 0)"
-  [[ "$size1" == "$size2" && "$size2" -gt 0 ]] || return 0
+  stable_hash="$(/usr/bin/shasum -a 256 "$INCOMING" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
+  [[ -n "$stable_hash" && "$stable_hash" == "$archive_hash" ]] || return 0
+  archive_hash="$stable_hash"
   /usr/bin/unzip -tqq "$INCOMING" >/dev/null 2>&1 || return 0
 
   staging="$(/usr/bin/mktemp -d "$STATE_DIR/incoming.XXXXXX")" || return 1
@@ -211,26 +268,95 @@ import_incoming() {
     return 1
   }
 
-  backup="$STATE_DIR/backup-$(date '+%Y%m%d-%H%M%S')"
-  mkdir -p "$backup"
+  # Відхиляємо порожні архіви, каталоги, посилання та сторонні файли.
+  found_expected=false
+  while IFS= read -r -d '' file; do
+    relative_name="${file#$staging/}"
+    if [[ "$relative_name" == "$file" || "$relative_name" == */* || ! -f "$file" || -L "$file" ]] ||
+       ! is_expected_save_name "$relative_name"; then
+      log "Вхідний ZIP містить недозволений об’єкт: $relative_name"
+      /bin/rm -rf "$staging"
+      return 1
+    fi
+    found_expected=true
+  done < <(/usr/bin/find "$staging" -mindepth 1 -print0)
 
+  if [[ "$found_expected" != "true" ]]; then
+    log "Вхідний ZIP не містить сейва $SAVE_NAME"
+    /bin/rm -rf "$staging"
+    return 1
+  fi
+
+  # Переконуємося, що під час розпакування iCloud не замінив архів.
+  final_hash="$(/usr/bin/shasum -a 256 "$INCOMING" 2>/dev/null | /usr/bin/awk '{print $1}')" || {
+    /bin/rm -rf "$staging"
+    return 0
+  }
+  if [[ "$final_hash" != "$archive_hash" ]]; then
+    log "Вхідний ZIP змінився під час розпакування; імпорт буде повторено"
+    /bin/rm -rf "$staging"
+    return 0
+  fi
+
+  # Спочатку готуємо повну нову копію на тому самому диску, що й SAVE_DIR.
+  install_staging="$(/usr/bin/mktemp -d "$SAVE_DIR/.vcmi-async.XXXXXX")" || {
+    log "Не вдалося створити staging у папці сейвів"
+    /bin/rm -rf "$staging"
+    return 1
+  }
+  while IFS= read -r -d '' file; do
+    /bin/cp -p "$file" "$install_staging/" || {
+      log "Не вдалося підготувати вхідний сейв: $file"
+      /bin/rm -rf "$staging" "$install_staging"
+      return 1
+    }
+  done < <(/usr/bin/find "$staging" -maxdepth 1 -type f -print0)
+
+  backup="$(/usr/bin/mktemp -d "$STATE_DIR/backup-$(date '+%Y%m%d-%H%M%S').XXXXXX")" || {
+    log "Не вдалося створити каталог backup"
+    /bin/rm -rf "$staging" "$install_staging"
+    return 1
+  }
   while IFS= read -r file; do
-    [[ -f "$file" ]] && /bin/cp -p "$file" "$backup/"
+    [[ -f "$file" ]] || continue
+    /bin/cp -p "$file" "$backup/" || {
+      log "Не вдалося створити backup: $file"
+      /bin/rm -rf "$staging" "$install_staging" "$backup"
+      return 1
+    }
   done <<< "$(save_files)"
 
-  # Видаляємо лише файли цієї конкретної партії.
-  /bin/rm -f \
+  # Замінюємо лише файли цієї партії; при помилці відновлюємо backup.
+  if ! /bin/rm -f \
     "$SAVE_DIR/${SAVE_NAME}.vcgm1" \
     "$SAVE_DIR/${SAVE_NAME}.vsgm1" \
     "$SAVE_DIR/${SAVE_NAME}.vlgm1" \
-    "$SAVE_DIR/${SAVE_NAME}"
+    "$SAVE_DIR/${SAVE_NAME}"; then
+    log "Не вдалося прибрати попередню версію сейва"
+    restore_backup "$backup" || log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+    /bin/rm -rf "$staging" "$install_staging"
+    return 1
+  fi
 
-  /usr/bin/find "$staging" -maxdepth 1 -type f -exec /bin/cp -p {} "$SAVE_DIR/" \;
-  /bin/rm -rf "$staging"
+  while IFS= read -r -d '' file; do
+    if ! /bin/mv -f "$file" "$SAVE_DIR/"; then
+      log "Не вдалося встановити вхідний сейв; відновлюємо backup"
+      restore_backup "$backup" || log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+      /bin/rm -rf "$staging" "$install_staging"
+      return 1
+    fi
+  done < <(/usr/bin/find "$install_staging" -maxdepth 1 -type f -print0)
+  /bin/rm -rf "$staging" "$install_staging"
+
+  imported_hash="$(bundle_hash 2>/dev/null || true)"
+  if [[ -z "$imported_hash" ]]; then
+    log "Імпортований сейв не пройшов фінальну перевірку; відновлюємо backup"
+    restore_backup "$backup" || log "КРИТИЧНО: не вдалося відновити сейв із $backup"
+    return 1
+  fi
 
   print -r -- "$archive_hash" > "$LAST_INCOMING_FILE"
-  imported_hash="$(bundle_hash 2>/dev/null || true)"
-  [[ -n "$imported_hash" ]] && print -r -- "$imported_hash" > "$LAST_LOCAL_FILE"
+  print -r -- "$imported_hash" > "$LAST_LOCAL_FILE"
 
   log "Вхідний сейв імпортовано"
   notify_local
@@ -258,7 +384,7 @@ main_loop() {
       stable_hash="$(bundle_hash 2>/dev/null || true)"
 
       if [[ "$stable_hash" == "$current_hash" ]]; then
-        if package_and_send; then
+        if package_and_send "$stable_hash"; then
           print -r -- "$stable_hash" > "$LAST_LOCAL_FILE"
         fi
       fi
