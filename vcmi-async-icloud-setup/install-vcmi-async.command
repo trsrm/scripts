@@ -96,6 +96,9 @@ LAST_INCOMING_FILE="$STATE_DIR/last-incoming-archive-hash"
 OUTGOING="$ICLOUD_DIR/to-${PEER_ID}.zip"
 INCOMING="$ICLOUD_DIR/to-${SELF_ID}.zip"
 LAST_SEEN_INCOMING_SIGNATURE=""
+MAIL_AUTH_FILE="$STATE_DIR/mail-automation-ok"
+MAIL_TEST_REQUEST="$STATE_DIR/send-test-email"
+MAIL_READY=false
 
 log() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_DIR/agent.log"
@@ -144,18 +147,41 @@ end run
 APPLESCRIPT
 }
 
-send_email() {
-  [[ "$EMAIL_ENABLED" == "true" ]] || return 0
-  [[ -n "$PEER_EMAIL" ]] || return 0
+authorize_mail() {
+  [[ "$EMAIL_ENABLED" == "true" && -n "$PEER_EMAIL" ]] || {
+    MAIL_READY=true
+    return 0
+  }
 
-  /usr/bin/osascript - "$PEER_EMAIL" "$SELF_NAME" "$SAVE_NAME" <<'APPLESCRIPT' >/dev/null 2>&1
+  if /usr/bin/osascript <<'APPLESCRIPT' >/dev/null 2>&1
+with timeout of 30 seconds
+  tell application "Mail" to get version
+end timeout
+APPLESCRIPT
+  then
+    MAIL_READY=true
+    /usr/bin/touch "$MAIL_AUTH_FILE"
+    log "Доступ до Mail підтверджено"
+  else
+    MAIL_READY=false
+    /bin/rm -f "$MAIL_AUTH_FILE"
+    log "Немає доступу до Mail; email вимкнено до перезапуску агента"
+    return 1
+  fi
+}
+
+send_mail_message() {
+  local subject="$1" content="$2"
+  [[ "$MAIL_READY" == "true" ]] || return 1
+
+  if ! /usr/bin/osascript - "$PEER_EMAIL" "$subject" "$content" <<'APPLESCRIPT' >/dev/null 2>&1
 on run argv
   set recipientAddress to item 1 of argv
-  set senderName to item 2 of argv
-  set saveName to item 3 of argv
+  set subjectText to item 2 of argv
+  set bodyText to item 3 of argv
 
   tell application "Mail"
-    set msg to make new outgoing message with properties {visible:false, subject:"Heroes 3 — твоя черга", content:senderName & " завершив хід у партії «" & saveName & "»." & return & return & "Сейв синхронізується через iCloud Drive. Відкрий VCMI та завантаж «" & saveName & "»." & return}
+    set msg to make new outgoing message with properties {visible:false, subject:subjectText, content:bodyText & return}
     tell msg
       make new to recipient at end of to recipients with properties {address:recipientAddress}
       send
@@ -163,6 +189,27 @@ on run argv
   end tell
 end run
 APPLESCRIPT
+  then
+    MAIL_READY=false
+    /bin/rm -f "$MAIL_AUTH_FILE"
+    log "Mail повернув помилку; email вимкнено до перезапуску агента"
+    return 1
+  fi
+}
+
+send_email() {
+  local content
+  [[ "$EMAIL_ENABLED" == "true" ]] || return 0
+  [[ -n "$PEER_EMAIL" ]] || return 0
+
+  content="$SELF_NAME завершив хід у партії «$SAVE_NAME»."$'\n\n'"Сейв синхронізується через iCloud Drive. Відкрий VCMI та завантаж «$SAVE_NAME»."
+  send_mail_message "Heroes 3 — твоя черга" "$content"
+}
+
+send_test_email() {
+  send_mail_message \
+    "VCMI Async — тест" \
+    "Автоматизацію для $SELF_NAME налаштовано. Це тестовий лист."
 }
 
 save_files() {
@@ -432,6 +479,7 @@ main_loop() {
 
   housekeeping
   log "Агент запущено. SAVE_DIR=$SAVE_DIR; ICLOUD_DIR=$ICLOUD_DIR"
+  authorize_mail || true
 
   # Перший запуск: поточний локальний сейв стає базовим і не відправляється сам.
   if [[ ! -f "$LAST_LOCAL_FILE" ]]; then
@@ -443,6 +491,11 @@ main_loop() {
 
   while true; do
     import_incoming
+
+    if [[ -f "$MAIL_TEST_REQUEST" ]]; then
+      send_test_email && log "Тестовий email надіслано"
+      /bin/rm -f "$MAIL_TEST_REQUEST"
+    fi
 
     current_signature="$(save_signature 2>/dev/null || true)"
     if [[ "$current_signature" != "$handled_signature" ]]; then
@@ -514,6 +567,7 @@ cat > "$PLIST_PATH" <<EOF
 </plist>
 EOF
 
+/bin/rm -f "$STATE_DIR/mail-automation-ok" "$STATE_DIR/send-test-email"
 /bin/launchctl bootout "gui/$(id -u)/dev.romaniv.vcmi-async" 2>/dev/null || true
 /bin/launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 /bin/launchctl enable "gui/$(id -u)/dev.romaniv.vcmi-async"
@@ -527,28 +581,29 @@ echo
 echo "ВАЖЛИВО:"
 echo "- Перший наявний сейв вважається базовим і не відправляється."
 echo "- Щоб зробити першу передачу, відкрий VCMI, завантаж сейв, збережи його ще раз і закрий гру."
-echo "- Під час першої відправки macOS може попросити дозволити керування Mail. Натисни Allow."
 echo
 echo "Тестове системне повідомлення зараз з'явиться."
 /usr/bin/osascript -e 'display notification "Фоновий агент установлено" with title "VCMI Async"'
 
 if [[ -n "$PEER_EMAIL" ]]; then
   echo
-  read "TEST_MAIL?Надіслати тестовий email другому гравцеві зараз? [y/N]: "
-  if [[ "${TEST_MAIL:l}" == "y" ]]; then
-    /usr/bin/osascript - "$PEER_EMAIL" "$SELF_NAME" <<'APPLESCRIPT'
-on run argv
-  set recipientAddress to item 1 of argv
-  set senderName to item 2 of argv
-  tell application "Mail"
-    set msg to make new outgoing message with properties {visible:false, subject:"VCMI Async — тест", content:"Автоматизацію для " & senderName & " налаштовано. Це тестовий лист." & return}
-    tell msg
-      make new to recipient at end of to recipients with properties {address:recipientAddress}
-      send
-    end tell
-  end tell
-end run
-APPLESCRIPT
+  echo "macOS може один раз попросити дозволити фоновому агенту керувати Mail."
+  echo "Натисни Allow. Надалі агент не перевірятиме дозвіл перед кожним листом."
+  for _ in {1..35}; do
+    [[ -f "$STATE_DIR/mail-automation-ok" ]] && break
+    /bin/sleep 1
+  done
+
+  if [[ -f "$STATE_DIR/mail-automation-ok" ]]; then
+    echo "Доступ до Mail підтверджено."
+    read "TEST_MAIL?Надіслати тестовий email другому гравцеві зараз? [y/N]: "
+    if [[ "${TEST_MAIL:l}" == "y" ]]; then
+      /usr/bin/touch "$STATE_DIR/send-test-email"
+      echo "Запит передано фоновому агенту."
+    fi
+  else
+    echo "Доступ до Mail не підтверджено. Email поки вимкнено, але iCloud-синхронізація працює."
+    echo "Щоб спробувати ще раз, перезапусти агент і натисни Allow."
   fi
 fi
 
