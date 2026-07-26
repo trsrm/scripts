@@ -40,6 +40,8 @@ if [[ -f "$CONFIG_PATH" ]]; then
   IS_UPDATE=true
   source "$CONFIG_PATH"
   EMAIL_ENABLED="${EMAIL_ENABLED:-true}"
+  CLEANUP_ENABLED="${CLEANUP_ENABLED:-true}"
+  CLEANUP_KEEP="${CLEANUP_KEEP:-3}"
   POLL_SECONDS="${POLL_SECONDS:-10}"
   STABILITY_SECONDS="${STABILITY_SECONDS:-6}"
 
@@ -53,6 +55,7 @@ if [[ -f "$CONFIG_PATH" ]]; then
   prompt_default "Ім'я другого гравця" "$PEER_NAME"; PEER_NAME="$REPLY"
   prompt_default "Email другого гравця (- щоб вимкнути)" "$PEER_EMAIL"; PEER_EMAIL="$REPLY"
   [[ "$PEER_EMAIL" == "-" ]] && PEER_EMAIL=""
+  prompt_default "Кількість збережених вихідних ZIP" "$CLEANUP_KEEP"; CLEANUP_KEEP="$REPLY"
 else
   echo "Вибери локальну папку VCMI Saves."
   echo "Типовий шлях: ~/Library/Application Support/vcmi/Saves"
@@ -71,6 +74,8 @@ else
   read "PEER_EMAIL?Email другого гравця (Enter — без email): "
   PEER_EMAIL="${PEER_EMAIL:-}"
   EMAIL_ENABLED=true
+  CLEANUP_ENABLED=true
+  CLEANUP_KEEP=3
   POLL_SECONDS=10
   STABILITY_SECONDS=6
 fi
@@ -84,6 +89,10 @@ if [[ ! "$SELF_ID" =~ '^[a-z0-9_-]+$' || ! "$PEER_ID" =~ '^[a-z0-9_-]+$' ]]; the
   echo "ID може містити лише латинські літери, цифри, _ та -"
   exit 1
 fi
+if [[ ! "$CLEANUP_KEEP" =~ '^[1-9][0-9]*$' ]]; then
+  echo "Кількість збережених ZIP має бути додатним числом"
+  exit 1
+fi
 
 cat > "$CONFIG_PATH" <<EOF
 SAVE_DIR=${(q)SAVE_DIR}
@@ -95,6 +104,8 @@ PEER_ID=${(q)PEER_ID}
 PEER_NAME=${(q)PEER_NAME}
 PEER_EMAIL=${(q)PEER_EMAIL}
 EMAIL_ENABLED=${(q)EMAIL_ENABLED}
+CLEANUP_ENABLED=${(q)CLEANUP_ENABLED}
+CLEANUP_KEEP=${(q)CLEANUP_KEEP}
 POLL_SECONDS=${(q)POLL_SECONDS}
 STABILITY_SECONDS=${(q)STABILITY_SECONDS}
 EOF
@@ -105,6 +116,9 @@ set -u
 
 CONFIG_DIR="$HOME/Library/Application Support/VCMIAsync"
 source "$CONFIG_DIR/config.zsh"
+CLEANUP_ENABLED="${CLEANUP_ENABLED:-true}"
+CLEANUP_KEEP="${CLEANUP_KEEP:-3}"
+[[ "$CLEANUP_KEEP" =~ '^[1-9][0-9]*$' ]] || CLEANUP_KEEP=3
 
 STATE_DIR="$CONFIG_DIR/state"
 LOG_DIR="$CONFIG_DIR/logs"
@@ -194,6 +208,53 @@ notify_local() {
     "Heroes 3 — твоя черга" \
     "$PEER_NAME завершив хід" \
     "Сейв «$SAVE_NAME» уже завантажено. Можна відкривати VCMI."
+}
+
+cleanup_outgoing() {
+  [[ "$CLEANUP_ENABLED" == "true" ]] || return 0
+
+  local i file failed=false
+  local -a archives obsolete
+  archives=("$ICLOUD_DIR"/to-${PEER_ID}-*.zip(.omN))
+  (( ${#archives} > CLEANUP_KEEP )) || return 0
+
+  for (( i = CLEANUP_KEEP + 1; i <= ${#archives}; ++i )); do
+    obsolete+=("$archives[$i]")
+  done
+
+  /usr/bin/osascript -l JavaScript - "${obsolete[@]}" <<'JXA' >/dev/null 2>&1 || true
+ObjC.import("Foundation");
+
+function run(argv) {
+  argv.forEach(path => {
+    const url = $.NSURL.fileURLWithPath(path);
+    const coordinator = $.NSFileCoordinator.alloc.initWithFilePresenter(undefined);
+    const coordinationError = Ref();
+
+    coordinator.coordinateWritingItemAtURLOptionsErrorByAccessor(
+      url,
+      1,
+      coordinationError,
+      coordinatedURL => {
+        const deletionError = Ref();
+        $.NSFileManager.defaultManager.removeItemAtURLError(coordinatedURL, deletionError);
+      }
+    );
+  });
+}
+JXA
+
+  for file in "${obsolete[@]}"; do
+    [[ -e "$file" ]] && failed=true
+  done
+
+  if [[ "$failed" == "false" ]]; then
+    log "Очищено старих вихідних ZIP: ${#obsolete}"
+    resolve_alerts "Автоочищення знову працює" "Старі транспортні ZIP знову видаляються." cleanup
+  else
+    log "Не вдалося координовано видалити старі вихідні ZIP"
+    raise_alert cleanup "Старі ZIP не очищаються" "Передача сейвів працює. Агент повторить очищення після наступного ходу."
+  fi
 }
 
 authorize_mail() {
@@ -389,6 +450,7 @@ package_and_send() {
   /bin/rm -rf "$staging" "$tmpzip"
   log "Сейв відправлено: $outgoing"
   resolve_alerts "" "" outgoing
+  cleanup_outgoing || true
 
   # Даємо iCloud трохи часу почати завантаження, потім надсилаємо email.
   /bin/sleep 10
@@ -706,7 +768,9 @@ cat > "$PLIST_PATH" <<EOF
 </plist>
 EOF
 
-[[ "$IS_UPDATE" == "false" ]] && /bin/rm -f "$STATE_DIR/mail-automation-ok" "$STATE_DIR/send-test-email"
+if [[ "$IS_UPDATE" == "false" ]]; then
+  /bin/rm -f "$STATE_DIR/mail-automation-ok" "$STATE_DIR/send-test-email"
+fi
 /bin/launchctl bootout "gui/$(id -u)/dev.romaniv.vcmi-async" 2>/dev/null || true
 /bin/launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 /bin/launchctl enable "gui/$(id -u)/dev.romaniv.vcmi-async"
