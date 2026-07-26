@@ -126,10 +126,13 @@ mkdir -p "$STATE_DIR" "$LOG_DIR" "$ICLOUD_DIR"
 
 LAST_LOCAL_FILE="$STATE_DIR/last-local-hash"
 LAST_INCOMING_FILE="$STATE_DIR/last-incoming-archive-hash"
-LAST_SEEN_INCOMING_SIGNATURE=""
+LAST_INCOMING_NAME_FILE="$STATE_DIR/last-incoming-name"
+INCOMING_CACHE_DIR="$STATE_DIR/incoming-cache"
 MAIL_AUTH_FILE="$STATE_DIR/mail-automation-ok"
 MAIL_TEST_REQUEST="$STATE_DIR/send-test-email"
+FINDER_READY=false
 MAIL_READY=false
+mkdir -p "$INCOMING_CACHE_DIR"
 
 log() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_DIR/agent.log"
@@ -197,7 +200,8 @@ housekeeping() {
   done
 
   now="$(/bin/date '+%s')"
-  for candidate in "$STATE_DIR"/incoming.*(N) "$STATE_DIR"/outgoing.*(N) "$SAVE_DIR"/.vcmi-async.*(N); do
+  for candidate in "$STATE_DIR"/incoming.*(N) "$STATE_DIR"/outgoing.*(N) \
+    "$INCOMING_CACHE_DIR"/*(N) "$SAVE_DIR"/.vcmi-async.*(N); do
     modified="$(/usr/bin/stat -f '%m' "$candidate" 2>/dev/null)" || continue
     (( now - modified > 86400 )) && /bin/rm -rf "$candidate"
   done
@@ -208,6 +212,24 @@ notify_local() {
     "Heroes 3 — твоя черга" \
     "$PEER_NAME завершив хід" \
     "Сейв «$SAVE_NAME» уже завантажено. Можна відкривати VCMI."
+}
+
+authorize_finder() {
+  if /usr/bin/osascript <<'APPLESCRIPT' >/dev/null 2>&1
+with timeout of 30 seconds
+  tell application "Finder" to get version
+end timeout
+APPLESCRIPT
+  then
+    FINDER_READY=true
+    log "Доступ до Finder підтверджено"
+    resolve_alerts "iCloud знову доступний" "Агент знову може отримувати сейви." finder
+  else
+    FINDER_READY=false
+    log "Немає доступу до Finder; отримання сейвів вимкнено до перезапуску агента"
+    raise_alert finder "Не вдалося прочитати iCloud" "Дозволь керування Finder і перезапусти агент. Локальний сейв не змінено."
+    return 1
+  fi
 }
 
 cleanup_outgoing() {
@@ -505,36 +527,95 @@ restore_backup() {
   done < <(/usr/bin/find "$backup" -maxdepth 1 -type f -print0)
 }
 
+stage_incoming() {
+  local incoming_name processed_name target
+  [[ "$FINDER_READY" == "true" ]] || return 1
+
+  processed_name="$(cat "$LAST_INCOMING_NAME_FILE" 2>/dev/null || true)"
+  incoming_name="$(/usr/bin/osascript - \
+    "$ICLOUD_DIR" "$INCOMING_CACHE_DIR" "to-${SELF_ID}-" "$processed_name" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set sourceFolder to POSIX file (item 1 of argv) as alias
+  set destinationFolder to POSIX file (item 2 of argv) as alias
+  set namePrefix to item 3 of argv
+  set processedName to item 4 of argv
+  tell application "Finder" to set candidates to every file in sourceFolder
+  set newestFile to missing value
+  set newestDate to missing value
+
+  repeat with candidate in candidates
+    tell application "Finder"
+      set candidateName to name of candidate
+      set candidateDate to modification date of candidate
+    end tell
+    if candidateName starts with namePrefix and candidateName ends with ".zip" then
+      if newestFile is missing value or candidateDate > newestDate then
+        set newestFile to candidate
+        set newestDate to candidateDate
+      end if
+    end if
+  end repeat
+
+  if newestFile is missing value then return ""
+  tell application "Finder" to set newestName to name of newestFile
+  if newestName is processedName then return ""
+  tell application "Finder" to duplicate newestFile to destinationFolder with replacing
+  return newestName
+end run
+APPLESCRIPT
+  )" || {
+    log "Finder не зміг отримати вхідний ZIP"
+    raise_alert finder "Не вдалося завантажити сейв" "Агент повторить спробу автоматично. Локальний сейв не змінено."
+    return 1
+  }
+  [[ -n "$incoming_name" ]] || return 0
+
+  case "$incoming_name" in
+    ("to-${SELF_ID}-"*.zip) ;;
+    (*)
+      log "Finder повернув неочікуване ім’я: $incoming_name"
+      return 1
+      ;;
+  esac
+  [[ "$incoming_name" != */* ]] || return 1
+
+  target="$INCOMING_CACHE_DIR/$incoming_name"
+  [[ -f "$target" ]] || return 1
+
+  resolve_alerts "iCloud знову доступний" "Агент знову може отримувати сейви." finder
+  print -r -- "$target"
+}
+
 import_incoming() {
   local archive_hash stable_hash final_hash old_hash staging install_staging
-  local backup imported_hash file relative_name found_expected incoming_signature incoming
-  local -a incoming_files
-  incoming_files=("$ICLOUD_DIR"/to-${SELF_ID}-*.zip(.omN))
-  if (( ${#incoming_files} == 0 )); then
-    LAST_SEEN_INCOMING_SIGNATURE=""
+  local backup imported_hash file relative_name found_expected incoming incoming_name
+  incoming="$(stage_incoming)" || return 0
+  [[ -n "$incoming" ]] || return 0
+  incoming_name="${incoming:t}"
+
+  archive_hash="$(/usr/bin/shasum -a 256 "$incoming" 2>/dev/null | /usr/bin/awk '{print $1}')" || {
+    /bin/rm -f "$incoming"
     return 0
-  fi
-  incoming="$incoming_files[1]"
-
-  incoming_signature="$(file_signature "$incoming")" || return 0
-  [[ "$incoming_signature" != "$LAST_SEEN_INCOMING_SIGNATURE" ]] || return 0
-
-  archive_hash="$(/usr/bin/shasum -a 256 "$incoming" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
+  }
   [[ -n "$archive_hash" ]] || return 0
   old_hash="$(cat "$LAST_INCOMING_FILE" 2>/dev/null || true)"
   if [[ "$archive_hash" == "$old_hash" ]]; then
-    LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
+    print -r -- "$incoming_name" > "$LAST_INCOMING_NAME_FILE"
+    /bin/rm -f "$incoming"
     return 0
   fi
 
   # Перевіряємо, що весь архів, а не лише його розмір, уже стабільний.
   /bin/sleep "$STABILITY_SECONDS"
   stable_hash="$(/usr/bin/shasum -a 256 "$incoming" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
-  [[ -n "$stable_hash" && "$stable_hash" == "$archive_hash" ]] || return 0
+  if [[ -z "$stable_hash" || "$stable_hash" != "$archive_hash" ]]; then
+    /bin/rm -f "$incoming"
+    return 0
+  fi
   archive_hash="$stable_hash"
   if ! /usr/bin/unzip -tqq "$incoming" >/dev/null 2>&1; then
     raise_alert incoming "Новий сейв не імпортовано" "Вхідний ZIP пошкоджений або не завантажився повністю. Локальний сейв не змінено."
-    LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
+    /bin/rm -f "$incoming"
     return 0
   fi
 
@@ -545,7 +626,7 @@ import_incoming() {
   /usr/bin/ditto -x -k "$incoming" "$staging" || {
     log "Не вдалося розпакувати вхідний сейв"
     raise_alert incoming "Новий сейв не імпортовано" "Не вдалося розпакувати ZIP. Локальний сейв не змінено."
-    /bin/rm -rf "$staging"
+    /bin/rm -rf "$staging" "$incoming"
     return 1
   }
 
@@ -557,7 +638,6 @@ import_incoming() {
        ! is_expected_save_name "$relative_name"; then
       log "Вхідний ZIP містить недозволений об’єкт: $relative_name"
       raise_alert incoming "Новий сейв не імпортовано" "ZIP містить неочікувані файли. Локальний сейв не змінено."
-      LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
       /bin/rm -rf "$staging"
       return 1
     fi
@@ -567,7 +647,6 @@ import_incoming() {
   if [[ "$found_expected" != "true" ]]; then
     log "Вхідний ZIP не містить сейва $SAVE_NAME"
     raise_alert incoming "Новий сейв не імпортовано" "ZIP не містить сейва «$SAVE_NAME». Локальний сейв не змінено."
-    LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
     /bin/rm -rf "$staging"
     return 1
   fi
@@ -579,7 +658,7 @@ import_incoming() {
   }
   if [[ "$final_hash" != "$archive_hash" ]]; then
     log "Вхідний ZIP змінився під час розпакування; імпорт буде повторено"
-    /bin/rm -rf "$staging"
+    /bin/rm -rf "$staging" "$incoming"
     return 0
   fi
 
@@ -660,8 +739,9 @@ import_incoming() {
   fi
 
   print -r -- "$archive_hash" > "$LAST_INCOMING_FILE"
+  print -r -- "$incoming_name" > "$LAST_INCOMING_NAME_FILE"
   print -r -- "$imported_hash" > "$LAST_LOCAL_FILE"
-  LAST_SEEN_INCOMING_SIGNATURE="$(file_signature "$incoming" || print -r -- "$incoming_signature")"
+  /bin/rm -f "$incoming"
 
   log "Вхідний сейв імпортовано"
   resolve_alerts "" "" incoming import critical
@@ -675,6 +755,7 @@ main_loop() {
 
   housekeeping
   log "Агент запущено. SAVE_DIR=$SAVE_DIR; ICLOUD_DIR=$ICLOUD_DIR"
+  authorize_finder || true
   authorize_mail || true
 
   # Перший запуск: поточний локальний сейв стає базовим і не відправляється сам.
