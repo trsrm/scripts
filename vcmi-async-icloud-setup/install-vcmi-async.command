@@ -29,42 +29,61 @@ end run
 APPLESCRIPT
 }
 
-echo "Вибери локальну папку VCMI Saves."
-echo "Типовий шлях: ~/Library/Application Support/vcmi/Saves"
-SAVE_DIR="$(choose_folder "Вибери папку VCMI Saves")"
+prompt_default() {
+  local label="$1" default="$2" value
+  read "value?${label} [${default}]: "
+  REPLY="${value:-$default}"
+}
+
+IS_UPDATE=false
+if [[ -f "$CONFIG_PATH" ]]; then
+  IS_UPDATE=true
+  source "$CONFIG_PATH"
+  EMAIL_ENABLED="${EMAIL_ENABLED:-true}"
+  POLL_SECONDS="${POLL_SECONDS:-10}"
+  STABILITY_SECONDS="${STABILITY_SECONDS:-6}"
+
+  echo "Знайдено наявну конфігурацію. Натисни Enter, щоб залишити поточне значення."
+  prompt_default "Папка VCMI Saves" "$SAVE_DIR"; SAVE_DIR="$REPLY"
+  prompt_default "Спільна папка VCMI Async" "$ICLOUD_DIR"; ICLOUD_DIR="$REPLY"
+  prompt_default "Назва сейва без розширення" "$SAVE_NAME"; SAVE_NAME="$REPLY"
+  prompt_default "Твій короткий ID" "$SELF_ID"; SELF_ID="$REPLY"
+  prompt_default "Твоє ім'я для повідомлень" "$SELF_NAME"; SELF_NAME="$REPLY"
+  prompt_default "ID другого гравця" "$PEER_ID"; PEER_ID="$REPLY"
+  prompt_default "Ім'я другого гравця" "$PEER_NAME"; PEER_NAME="$REPLY"
+  prompt_default "Email другого гравця (- щоб вимкнути)" "$PEER_EMAIL"; PEER_EMAIL="$REPLY"
+  [[ "$PEER_EMAIL" == "-" ]] && PEER_EMAIL=""
+else
+  echo "Вибери локальну папку VCMI Saves."
+  echo "Типовий шлях: ~/Library/Application Support/vcmi/Saves"
+  SAVE_DIR="$(choose_folder "Вибери папку VCMI Saves")"
+
+  echo
+  echo "Вибери СПІЛЬНУ папку VCMI Async в iCloud Drive."
+  ICLOUD_DIR="$(choose_folder "Вибери спільну папку VCMI Async в iCloud Drive")"
+
+  echo
+  prompt_default "Назва сейва без розширення" "ASYNC_GAME"; SAVE_NAME="$REPLY"
+  read "SELF_ID?Твій короткий ID латиницею, наприклад taras: "
+  prompt_default "Твоє ім'я для повідомлень" "$SELF_ID"; SELF_NAME="$REPLY"
+  read "PEER_ID?ID другого гравця латиницею, наприклад andrii: "
+  prompt_default "Ім'я другого гравця" "$PEER_ID"; PEER_NAME="$REPLY"
+  read "PEER_EMAIL?Email другого гравця (Enter — без email): "
+  PEER_EMAIL="${PEER_EMAIL:-}"
+  EMAIL_ENABLED=true
+  POLL_SECONDS=10
+  STABILITY_SECONDS=6
+fi
+
 SAVE_DIR="${SAVE_DIR%/}"
-
-echo
-echo "Вибери СПІЛЬНУ папку VCMI Async в iCloud Drive."
-ICLOUD_DIR="$(choose_folder "Вибери спільну папку VCMI Async в iCloud Drive")"
 ICLOUD_DIR="${ICLOUD_DIR%/}"
-
-echo
-read "SAVE_NAME?Назва сейва без розширення [ASYNC_GAME]: "
-SAVE_NAME="${SAVE_NAME:-ASYNC_GAME}"
-
-read "SELF_ID?Твій короткий ID латиницею, наприклад taras: "
 SELF_ID="${SELF_ID:l}"
-if [[ ! "$SELF_ID" =~ '^[a-z0-9_-]+$' ]]; then
-  echo "ID може містити лише латинські літери, цифри, _ та -"
-  exit 1
-fi
-
-read "SELF_NAME?Твоє ім'я для повідомлень [${SELF_ID}]: "
-SELF_NAME="${SELF_NAME:-$SELF_ID}"
-
-read "PEER_ID?ID другого гравця латиницею, наприклад andrii: "
 PEER_ID="${PEER_ID:l}"
-if [[ ! "$PEER_ID" =~ '^[a-z0-9_-]+$' ]]; then
+
+if [[ ! "$SELF_ID" =~ '^[a-z0-9_-]+$' || ! "$PEER_ID" =~ '^[a-z0-9_-]+$' ]]; then
   echo "ID може містити лише латинські літери, цифри, _ та -"
   exit 1
 fi
-
-read "PEER_NAME?Ім'я другого гравця [${PEER_ID}]: "
-PEER_NAME="${PEER_NAME:-$PEER_ID}"
-
-read "PEER_EMAIL?Email другого гравця (Enter — без email): "
-PEER_EMAIL="${PEER_EMAIL:-}"
 
 cat > "$CONFIG_PATH" <<EOF
 SAVE_DIR=${(q)SAVE_DIR}
@@ -75,9 +94,9 @@ SELF_NAME=${(q)SELF_NAME}
 PEER_ID=${(q)PEER_ID}
 PEER_NAME=${(q)PEER_NAME}
 PEER_EMAIL=${(q)PEER_EMAIL}
-EMAIL_ENABLED=true
-POLL_SECONDS=10
-STABILITY_SECONDS=6
+EMAIL_ENABLED=${(q)EMAIL_ENABLED}
+POLL_SECONDS=${(q)POLL_SECONDS}
+STABILITY_SECONDS=${(q)STABILITY_SECONDS}
 EOF
 
 cat > "$SCRIPT_PATH" <<'SCRIPT'
@@ -93,8 +112,6 @@ mkdir -p "$STATE_DIR" "$LOG_DIR" "$ICLOUD_DIR"
 
 LAST_LOCAL_FILE="$STATE_DIR/last-local-hash"
 LAST_INCOMING_FILE="$STATE_DIR/last-incoming-archive-hash"
-OUTGOING="$ICLOUD_DIR/to-${PEER_ID}.zip"
-INCOMING="$ICLOUD_DIR/to-${SELF_ID}.zip"
 LAST_SEEN_INCOMING_SIGNATURE=""
 MAIL_AUTH_FILE="$STATE_DIR/mail-automation-ok"
 MAIL_TEST_REQUEST="$STATE_DIR/send-test-email"
@@ -313,7 +330,7 @@ bundle_hash() {
 
 package_and_send() {
   local expected_hash="$1"
-  local staging tmpzip file copied_hash email_status="disabled"
+  local staging tmpzip file copied_hash outgoing short_hash email_status="disabled"
   staging="$(/usr/bin/mktemp -d "$STATE_DIR/outgoing.XXXXXX")" || {
     raise_alert outgoing "Хід ще не передано" "Не вдалося створити staging. Агент повторить спробу автоматично."
     return 1
@@ -360,24 +377,17 @@ package_and_send() {
     return 1
   }
 
-  # Атомарна заміна в межах спільної iCloud-папки.
-  /bin/cp "$tmpzip" "${OUTGOING}.new" || {
-    log "Не вдалося записати ZIP у iCloud: ${OUTGOING}.new"
+  short_hash="${expected_hash[1,12]}"
+  outgoing="$ICLOUD_DIR/to-${PEER_ID}-${short_hash}.zip"
+  if [[ ! -f "$outgoing" ]] && ! /bin/cp "$tmpzip" "$outgoing"; then
+    log "Не вдалося записати ZIP в iCloud: $outgoing"
     raise_alert outgoing "Хід ще не передано" "Не вдалося записати сейв в iCloud. Агент повторює спробу автоматично."
-    /bin/rm -f "${OUTGOING}.new"
     /bin/rm -rf "$staging" "$tmpzip"
     return 1
-  }
-  /bin/mv -f "${OUTGOING}.new" "$OUTGOING" || {
-    log "Не вдалося опублікувати ZIP в iCloud: $OUTGOING"
-    raise_alert outgoing "Хід ще не передано" "Не вдалося опублікувати сейв в iCloud. Агент повторює спробу автоматично."
-    /bin/rm -f "${OUTGOING}.new"
-    /bin/rm -rf "$staging" "$tmpzip"
-    return 1
-  }
+  fi
 
   /bin/rm -rf "$staging" "$tmpzip"
-  log "Сейв відправлено: $OUTGOING"
+  log "Сейв відправлено: $outgoing"
   resolve_alerts "" "" outgoing
 
   # Даємо iCloud трохи часу почати завантаження, потім надсилаємо email.
@@ -435,16 +445,19 @@ restore_backup() {
 
 import_incoming() {
   local archive_hash stable_hash final_hash old_hash staging install_staging
-  local backup imported_hash file relative_name found_expected incoming_signature
-  if [[ ! -f "$INCOMING" ]]; then
+  local backup imported_hash file relative_name found_expected incoming_signature incoming
+  local -a incoming_files
+  incoming_files=("$ICLOUD_DIR"/to-${SELF_ID}-*.zip(.omN))
+  if (( ${#incoming_files} == 0 )); then
     LAST_SEEN_INCOMING_SIGNATURE=""
     return 0
   fi
+  incoming="$incoming_files[1]"
 
-  incoming_signature="$(file_signature "$INCOMING")" || return 0
+  incoming_signature="$(file_signature "$incoming")" || return 0
   [[ "$incoming_signature" != "$LAST_SEEN_INCOMING_SIGNATURE" ]] || return 0
 
-  archive_hash="$(/usr/bin/shasum -a 256 "$INCOMING" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
+  archive_hash="$(/usr/bin/shasum -a 256 "$incoming" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
   [[ -n "$archive_hash" ]] || return 0
   old_hash="$(cat "$LAST_INCOMING_FILE" 2>/dev/null || true)"
   if [[ "$archive_hash" == "$old_hash" ]]; then
@@ -454,10 +467,10 @@ import_incoming() {
 
   # Перевіряємо, що весь архів, а не лише його розмір, уже стабільний.
   /bin/sleep "$STABILITY_SECONDS"
-  stable_hash="$(/usr/bin/shasum -a 256 "$INCOMING" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
+  stable_hash="$(/usr/bin/shasum -a 256 "$incoming" 2>/dev/null | /usr/bin/awk '{print $1}')" || return 0
   [[ -n "$stable_hash" && "$stable_hash" == "$archive_hash" ]] || return 0
   archive_hash="$stable_hash"
-  if ! /usr/bin/unzip -tqq "$INCOMING" >/dev/null 2>&1; then
+  if ! /usr/bin/unzip -tqq "$incoming" >/dev/null 2>&1; then
     raise_alert incoming "Новий сейв не імпортовано" "Вхідний ZIP пошкоджений або не завантажився повністю. Локальний сейв не змінено."
     LAST_SEEN_INCOMING_SIGNATURE="$incoming_signature"
     return 0
@@ -467,7 +480,7 @@ import_incoming() {
     raise_alert incoming "Новий сейв не імпортовано" "Не вдалося створити staging. Локальний сейв не змінено."
     return 1
   }
-  /usr/bin/ditto -x -k "$INCOMING" "$staging" || {
+  /usr/bin/ditto -x -k "$incoming" "$staging" || {
     log "Не вдалося розпакувати вхідний сейв"
     raise_alert incoming "Новий сейв не імпортовано" "Не вдалося розпакувати ZIP. Локальний сейв не змінено."
     /bin/rm -rf "$staging"
@@ -498,7 +511,7 @@ import_incoming() {
   fi
 
   # Переконуємося, що під час розпакування iCloud не замінив архів.
-  final_hash="$(/usr/bin/shasum -a 256 "$INCOMING" 2>/dev/null | /usr/bin/awk '{print $1}')" || {
+  final_hash="$(/usr/bin/shasum -a 256 "$incoming" 2>/dev/null | /usr/bin/awk '{print $1}')" || {
     /bin/rm -rf "$staging"
     return 0
   }
@@ -586,7 +599,7 @@ import_incoming() {
 
   print -r -- "$archive_hash" > "$LAST_INCOMING_FILE"
   print -r -- "$imported_hash" > "$LAST_LOCAL_FILE"
-  LAST_SEEN_INCOMING_SIGNATURE="$(file_signature "$INCOMING" || print -r -- "$incoming_signature")"
+  LAST_SEEN_INCOMING_SIGNATURE="$(file_signature "$incoming" || print -r -- "$incoming_signature")"
 
   log "Вхідний сейв імпортовано"
   resolve_alerts "" "" incoming import critical
@@ -608,7 +621,12 @@ main_loop() {
     initial_hash="$(bundle_hash 2>/dev/null || true)"
     [[ -n "$initial_hash" ]] && print -r -- "$initial_hash" > "$LAST_LOCAL_FILE"
   fi
-  handled_signature="$(save_signature 2>/dev/null || true)"
+  current_signature="$(save_signature 2>/dev/null || true)"
+  current_hash="$(bundle_hash 2>/dev/null || true)"
+  previous_hash="$(cat "$LAST_LOCAL_FILE" 2>/dev/null || true)"
+  [[ -n "$current_hash" && "$current_hash" == "$previous_hash" ]] \
+    && handled_signature="$current_signature" \
+    || handled_signature=""
 
   while true; do
     import_incoming
@@ -688,7 +706,7 @@ cat > "$PLIST_PATH" <<EOF
 </plist>
 EOF
 
-/bin/rm -f "$STATE_DIR/mail-automation-ok" "$STATE_DIR/send-test-email"
+[[ "$IS_UPDATE" == "false" ]] && /bin/rm -f "$STATE_DIR/mail-automation-ok" "$STATE_DIR/send-test-email"
 /bin/launchctl bootout "gui/$(id -u)/dev.romaniv.vcmi-async" 2>/dev/null || true
 /bin/launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 /bin/launchctl enable "gui/$(id -u)/dev.romaniv.vcmi-async"
@@ -706,7 +724,7 @@ echo
 echo "Тестове системне повідомлення зараз з'явиться."
 /usr/bin/osascript -e 'display notification "Фоновий агент установлено" with title "VCMI Async"'
 
-if [[ -n "$PEER_EMAIL" ]]; then
+if [[ "$IS_UPDATE" == "false" && -n "$PEER_EMAIL" ]]; then
   echo
   echo "macOS може один раз попросити дозволити фоновому агенту керувати Mail."
   echo "Натисни Allow. Надалі агент не перевірятиме дозвіл перед кожним листом."
