@@ -159,21 +159,32 @@ bundle_hash_at() {
 }
 
 finder_stage_incoming() {
-  local stable_name="to-${SELF_ID}.zip"
+  local stable_name="to-${SELF_ID}.zip" outgoing_name="to-${PEER_ID}.zip"
 
   if [[ "$VCMI_ASYNC_ADAPTER" == "local" ]]; then
-    [[ -f "$ICLOUD_DIR/$stable_name" ]] || return 0
-    /bin/cp -f "$ICLOUD_DIR/$stable_name" "$INCOMING_CACHE_DIR/" || return 1
-    print -r -- "$stable_name"
+    local candidate
+    if [[ -f "$ICLOUD_DIR/$stable_name" ]]; then
+      /bin/cp -f "$ICLOUD_DIR/$stable_name" "$INCOMING_CACHE_DIR/" || return 1
+      print -r -- "$stable_name"
+      return
+    fi
+    for candidate in "$ICLOUD_DIR"/to-*.zip(.N); do
+      [[ "${candidate:t}" == "$outgoing_name" ]] && continue
+      print -r -- "IDENTITY_MISMATCH:${candidate:t}"
+      return
+    done
     return
   fi
 
-  /usr/bin/osascript - "$ICLOUD_DIR" "$INCOMING_CACHE_DIR" "$stable_name" <<'APPLESCRIPT' 2>/dev/null
+  /usr/bin/osascript - "$ICLOUD_DIR" "$INCOMING_CACHE_DIR" \
+    "$stable_name" "$outgoing_name" <<'APPLESCRIPT' 2>/dev/null
 on run argv
   set sourceFolder to POSIX file (item 1 of argv) as alias
   set destinationFolder to POSIX file (item 2 of argv) as alias
   set stableName to item 3 of argv
+  set outgoingName to item 4 of argv
   set sourceFile to missing value
+  set mismatchedName to ""
 
   with timeout of 60 seconds
     tell application "Finder" to set candidates to every file in sourceFolder
@@ -183,9 +194,15 @@ on run argv
         set sourceFile to candidate
         exit repeat
       end if
+      if candidateName starts with "to-" and candidateName ends with ".zip" and candidateName is not outgoingName then
+        set mismatchedName to candidateName
+      end if
     end repeat
 
-    if sourceFile is missing value then return ""
+    if sourceFile is missing value then
+      if mismatchedName is not "" then return "IDENTITY_MISMATCH:" & mismatchedName
+      return ""
+    end if
     tell application "Finder"
       set sourceName to name of sourceFile
       duplicate sourceFile to destinationFolder with replacing
@@ -215,7 +232,7 @@ APPLESCRIPT
 }
 
 stage_incoming() {
-  local incoming_name target
+  local incoming_name target actual_name expected_name="to-${SELF_ID}.zip"
   incoming_name="$(finder_stage_incoming)" || {
     /bin/rm -f "$FINDER_AUTH_FILE"
     log "Finder не зміг отримати вхідний ZIP"
@@ -225,9 +242,16 @@ stage_incoming() {
 
   /usr/bin/touch "$FINDER_AUTH_FILE"
   resolve_alerts "iCloud знову доступний" "Обмін сейвами відновлено." finder
+  if [[ "$incoming_name" == IDENTITY_MISMATCH:* ]]; then
+    actual_name="${incoming_name#IDENTITY_MISMATCH:}"
+    raise_alert identity "Перевір SELF_ID" \
+      "Агент шукає «$expected_name», але в iCloud є «$actual_name». Запусти інсталятор і виправ SELF_ID."
+    return 0
+  fi
   [[ -n "$incoming_name" && "$incoming_name" != */* ]] || return 0
 
-  [[ "$incoming_name" == "to-${SELF_ID}.zip" ]] || return 1
+  [[ "$incoming_name" == "$expected_name" ]] || return 1
+  resolve_alerts "SELF_ID виправлено" "Агент знову бачить адресований тобі ZIP." identity
 
   target="$INCOMING_CACHE_DIR/$incoming_name"
   [[ -f "$target" ]] || return 1

@@ -91,6 +91,7 @@ check "second stable check succeeds" run_agent
 check "stable ZIP is published" test -f "$ICLOUD_DIR/to-vitalii.zip"
 check "published ZIP is valid" /usr/bin/unzip -tqq "$ICLOUD_DIR/to-vitalii.zip"
 check_not "pending state clears after publish" test -f "$STATE_DIR/pending-local-hash"
+check_not "own outgoing ZIP is not an identity mismatch" test -f "$STATE_DIR/alert-identity"
 
 first_zip_hash="$(file_hash "$ICLOUD_DIR/to-vitalii.zip")"
 print -r -- transient > "$SAVE_DIR/async-game.vsgm1"
@@ -174,6 +175,29 @@ check "next process publishes email turn" run_agent
 check_equal "one email is sent" 1 "$(rg -c '^peer@example\.test\|' "$STATE_DIR/test-mails")"
 check "unchanged save remains quiet" run_agent
 check_equal "email is not duplicated" 1 "$(rg -c '^peer@example\.test\|' "$STATE_DIR/test-mails")"
+
+setup_game identity-mismatch
+{
+  print -r -- "SELF_ID=vitalik"
+  print -r -- "PEER_ID=taras"
+} >> "$CONFIG_DIR/config.zsh"
+print -r -- baseline > "$SAVE_DIR/async-game.vsgm1"
+make_save_zip "$ICLOUD_DIR/to-vitalii.zip" incoming-turn
+check "mismatched recipient ID is detected" run_agent
+check "mismatched recipient ID raises visible alert" test -f "$STATE_DIR/alert-identity"
+check "identity alert names expected and actual ZIP" \
+  /usr/bin/grep -q 'to-vitalik.zip.*to-vitalii.zip' "$STATE_DIR/test-notifications"
+check_not "mismatched recipient ZIP is not imported" \
+  /usr/bin/grep -q '^incoming-turn$' "$SAVE_DIR/async-game.vsgm1"
+identity_notifications="$(wc -l < "$STATE_DIR/test-notifications")"
+check "repeated mismatch check succeeds" run_agent
+check_equal "identity alert is deduplicated" \
+  "$identity_notifications" "$(wc -l < "$STATE_DIR/test-notifications")"
+print -r -- "SELF_ID=vitalii" >> "$CONFIG_DIR/config.zsh"
+check "corrected recipient ID imports waiting turn" run_agent
+check_equal "corrected recipient ZIP replaces save" \
+  incoming-turn "$(<"$SAVE_DIR/async-game.vsgm1")"
+check_not "corrected recipient ID clears alert" test -f "$STATE_DIR/alert-identity"
 
 setup_game invalid '*'
 check_not "invalid save name is rejected" run_agent

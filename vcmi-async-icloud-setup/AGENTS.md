@@ -86,6 +86,8 @@ Preserve coverage for:
 13. Mail permission state survives separate scheduled processes.
 14. One turn produces one email; unchanged state produces no duplicate.
 15. Invalid configuration fails before touching saves or transport.
+16. A recipient ZIP for another ID raises a deduplicated identity alert, is not
+    imported, and imports normally after `SELF_ID` is corrected.
 
 Add a regression scenario before fixing a newly discovered bug.
 
