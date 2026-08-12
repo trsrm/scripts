@@ -17,6 +17,7 @@ OUTGOING_CACHE_DIR="$STATE_DIR/outgoing-cache"
 FINDER_AUTH_FILE="$STATE_DIR/finder-automation-ok"
 MAIL_AUTH_FILE="$STATE_DIR/mail-automation-ok"
 MAIL_TEST_REQUEST="$STATE_DIR/send-test-email"
+LAUNCHER_PATH="${VCMI_ASYNC_LAUNCHER_PATH:-$HOME/Applications/Грати VCMI Async.app/Contents/MacOS/vcmi-async-launcher}"
 MAIL_READY=false
 
 validate_config() {
@@ -77,6 +78,23 @@ on run argv
   display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
 end run
 APPLESCRIPT
+}
+
+notify_turn_ready() {
+  local title="$1" subtitle="$2" message="$3"
+  if [[ "$VCMI_ASYNC_ADAPTER" == "local" ]]; then
+    print -r -- "TURN_READY|$title|$subtitle|$message" >> "$STATE_DIR/test-notifications"
+    return
+  fi
+
+  if [[ -x "$LAUNCHER_PATH" ]] && \
+    "$LAUNCHER_PATH" --notify-turn-ready "$title" "$subtitle" "$message" \
+      >/dev/null 2>&1; then
+    return
+  fi
+
+  log "Launcher не зміг створити actionable notification; використано звичайне"
+  notify_user "$title" "$subtitle" "$message"
 }
 
 raise_alert() {
@@ -342,7 +360,7 @@ send_email() {
   local content
   [[ "$EMAIL_ENABLED" == "true" && -n "$PEER_EMAIL" ]] || return 1
   content="$SELF_NAME завершив хід у партії «$SAVE_NAME»."$'\n\n'
-  content+="Сейв синхронізується через iCloud Drive. Відкрий VCMI та завантаж «$SAVE_NAME»."
+  content+="Сейв синхронізується через iCloud Drive. Дочекайся системного повідомлення на Mac — воно з’явиться після перевірки й імпорту сейву."
   send_mail_message "Heroes 3 — твоя черга" "$content"
 }
 
@@ -496,7 +514,7 @@ import_incoming() {
   /bin/rm -f "$incoming" "$PENDING_LOCAL_FILE"
   resolve_alerts "" "" incoming import critical
   log "Вхідний сейв імпортовано"
-  notify_user "Heroes 3 — твоя черга" "$PEER_NAME завершив хід" \
+  notify_turn_ready "Heroes 3 — твоя черга" "$PEER_NAME завершив хід" \
     "Сейв «$SAVE_NAME» уже завантажено. Можна відкривати VCMI."
 }
 

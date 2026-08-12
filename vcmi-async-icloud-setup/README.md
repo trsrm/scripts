@@ -2,8 +2,8 @@
 
 Асинхронна Hotseat-партія між двома Mac:
 
-1. дочекайся notification;
-2. відкрий VCMI та завантаж `ASYNC_GAME`;
+1. дочекайся notification про успішний імпорт;
+2. натисни notification або відкрий **Грати VCMI Async** зі списку програм;
 3. зроби хід;
 4. збережи під тією самою назвою;
 5. закрий VCMI.
@@ -34,10 +34,11 @@ to-vitalii.zip
 створює спільну папку `VCMI Async` в iCloud Drive та дає другому право
 редагування.
 
-Тримай ці файли разом:
+Тримай репозиторій разом, зокрема:
 
 - `install-vcmi-async.command`
 - `vcmi-async.zsh`
+- `launcher/`
 - `README.md`
 
 Запусти:
@@ -52,7 +53,15 @@ to-vitalii.zip
 ~/Library/Application Support/vcmi/Saves
 ```
 
-Один раз натисни `Allow` для Finder і, якщо потрібен email, для Mail.
+Інсталятор також встановить **Грати VCMI Async** у `~/Applications`. Застосунок
+з’явиться у списку програм macOS, Spotlight і його можна закріпити в Dock.
+
+Один раз натисни `Allow` для Finder, Accessibility і, якщо потрібен email, для
+Mail. Якщо macOS окремо попросить Notifications — також дозволь. Для локально
+підписаної збірки launcher автоматично використовує сумісне системне
+notification без облікового запису Apple Developer. Повідомлення **«Heroes 3 —
+твоя черга»** створюється лише після того, як ZIP перевірено, а сейв успішно
+встановлено локально.
 
 ## Оновлення
 
@@ -67,12 +76,13 @@ to-vitalii.zip
 
 Інсталятор підставить наявні дані. Enter залишає значення без змін. Зміна папки,
 назви сейва або ID скидає лише sync-state; конфігурація і backups зберігаються.
+Встановлена копія launcher’а також оновлюється цим самим installer’ом.
 
 ## Повідомлення і помилки
 
 Агент показує notification, коли:
 
-- отриманий сейв уже встановлено;
+- отриманий сейв уже встановлено — клік запускає VCMI й завантажує партію;
 - твій хід опубліковано;
 - `SELF_ID` не відповідає адресованому гравцеві ZIP у спільній папці;
 - Finder, Mail, ZIP або імпорт не працюють;
@@ -80,6 +90,9 @@ to-vitalii.zip
 
 Одна й та сама помилка показується один раз. Невдала операція автоматично
 повторюється під час наступного запуску. Помилка email не блокує iCloud.
+
+Email лише повідомляє, що інший гравець завершив хід. Не запускай гру з email:
+дочекайся системного notification на Mac, яке підтверджує локальний імпорт.
 
 ## Діагностика
 
@@ -112,4 +125,5 @@ zsh -n install-vcmi-async.command
 launchctl bootout "gui/$(id -u)/dev.romaniv.vcmi-async"
 rm -f "$HOME/Library/LaunchAgents/dev.romaniv.vcmi-async.plist"
 rm -rf "$HOME/Library/Application Support/VCMIAsync"
+rm -rf "$HOME/Applications/Грати VCMI Async.app"
 ```

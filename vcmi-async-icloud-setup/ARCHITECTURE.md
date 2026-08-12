@@ -38,10 +38,15 @@ compares its SHA-256 with `last-incoming-archive-hash`.
 5. Back up the current save.
 6. Install the new save, restoring the backup on failure.
 7. Persist the imported local hash before the archive hash.
-8. Notify the player.
+8. Ask the installed launcher to create an actionable notification.
 
 Writing the local hash first prevents an interrupted state update from sending
 the imported save back.
+
+The notification is deliberately downstream of archive validation, save
+installation, final hashing, and atomic import-state writes. Clicking it launches
+the same installed app used from Applications, Spotlight, or Dock. Email is not a
+launch signal because delivery can precede the receiver’s iCloud import.
 
 ## Outgoing
 
@@ -60,6 +65,25 @@ The pending state replaces sleeps and file-signature polling.
 - the newest 20 save backups are retained;
 - staging older than one day is removed;
 - iCloud contains only the two stable transport ZIPs.
+
+## Launcher
+
+The repository contains a prebuilt, locally signed app in `launcher/`. The main
+installer delegates to `launcher/install.zsh`, which verifies the signature and
+atomically installs the app at `~/Applications/Грати VCMI Async.app`.
+
+The launcher interface used by the sync module is one command:
+
+```text
+vcmi-async-launcher --notify-turn-ready TITLE SUBTITLE BODY
+```
+
+Its implementation owns notification replacement, the **Грати хід** action,
+Accessibility prompting, VCMI launch, and menu automation. It prefers
+UserNotifications. Because macOS rejects that API for some locally/ad-hoc signed
+apps, the same launcher has an AppKit notification compatibility path; no Apple
+Developer certificate is required. Only if both paths fail does the sync agent
+fall back to a plain notification, without weakening the import guarantees.
 
 ## Invariants
 

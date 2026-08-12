@@ -4,6 +4,7 @@ set -u
 ROOT_DIR="${0:A:h:h}"
 AGENT="$ROOT_DIR/vcmi-async.zsh"
 INSTALLER="$ROOT_DIR/install-vcmi-async.command"
+LAUNCHER_INSTALLER="$ROOT_DIR/launcher/install.zsh"
 TEST_ROOT="$(/usr/bin/mktemp -d /tmp/vcmi-async-tests.XXXXXX)"
 [[ "${KEEP_TEST_ROOT:-false}" == "true" ]] || trap '/bin/rm -rf "$TEST_ROOT"' EXIT
 
@@ -116,6 +117,8 @@ check_equal \
   "$(rg -c 'Сейв відправлено:' "$CONFIG_DIR/logs/agent.log")"
 backups=("$STATE_DIR"/backup-*(/N))
 check_equal "import creates one backup" 1 "${#backups}"
+check "import creates actionable turn notification" \
+  /usr/bin/grep -q '^TURN_READY|' "$STATE_DIR/test-notifications"
 
 notifications_before="$(wc -l < "$STATE_DIR/test-notifications")"
 check "unchanged incoming ZIP is ignored" run_agent
@@ -173,6 +176,8 @@ print -r -- email-turn > "$SAVE_DIR/async-game.vsgm1"
 check "email turn becomes pending" run_agent
 check "next process publishes email turn" run_agent
 check_equal "one email is sent" 1 "$(rg -c '^peer@example\.test\|' "$STATE_DIR/test-mails")"
+check "email tells player to wait for local import notification" \
+  /usr/bin/grep -q 'Дочекайся системного повідомлення' "$STATE_DIR/test-mails"
 check "unchanged save remains quiet" run_agent
 check_equal "email is not duplicated" 1 "$(rg -c '^peer@example\.test\|' "$STATE_DIR/test-mails")"
 
@@ -204,6 +209,32 @@ check_not "invalid save name is rejected" run_agent
 
 check "agent syntax" /bin/zsh -n "$AGENT"
 check "installer syntax" /bin/zsh -n "$INSTALLER"
+check "launcher installer syntax" /bin/zsh -n "$LAUNCHER_INSTALLER"
+check "main installer installs launcher" \
+  /usr/bin/grep -q 'launcher/install.zsh' "$INSTALLER"
+TEST_APPLICATIONS_DIR="$TEST_ROOT/Applications"
+TEST_LEGACY_LAUNCHER="$TEST_ROOT/legacy/Грати VCMI Async.app"
+/bin/mkdir -p "${TEST_LEGACY_LAUNCHER:h}"
+/bin/ln -s "$ROOT_DIR/launcher/Грати VCMI Async.app" "$TEST_LEGACY_LAUNCHER"
+check "launcher installs into Applications" env \
+  VCMI_ASYNC_APPLICATIONS_DIR="$TEST_APPLICATIONS_DIR" \
+  VCMI_ASYNC_LEGACY_APP_PATH="$TEST_LEGACY_LAUNCHER" \
+  /bin/zsh "$LAUNCHER_INSTALLER"
+check_not "launcher installer removes legacy compatibility link" \
+  test -L "$TEST_LEGACY_LAUNCHER"
+check "installed launcher is executable" test -x \
+  "$TEST_APPLICATIONS_DIR/Грати VCMI Async.app/Contents/MacOS/vcmi-async-launcher"
+check "installed launcher contains app icon" test -s \
+  "$TEST_APPLICATIONS_DIR/Грати VCMI Async.app/Contents/Resources/AppIcon.icns"
+check_equal "installed launcher declares app icon" "AppIcon" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$TEST_APPLICATIONS_DIR/Грати VCMI Async.app/Contents/Info.plist" 2>/dev/null)"
+check "installed launcher signature is valid" /usr/bin/codesign \
+  --verify --deep --strict "$TEST_APPLICATIONS_DIR/Грати VCMI Async.app"
+check "launcher self-test" \
+  "$TEST_APPLICATIONS_DIR/Грати VCMI Async.app/Contents/MacOS/vcmi-async-launcher" \
+  --self-test
+check_equal "launcher has stable technical bundle name" "VCMIAsyncLauncher" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$ROOT_DIR/launcher/Info.plist")"
 check "installer schedules one-minute runs" \
   /usr/bin/grep -A1 -q '<key>StartInterval</key>' "$INSTALLER"
 check_not "agent has no permanent loop" /usr/bin/grep -q 'while true' "$AGENT"

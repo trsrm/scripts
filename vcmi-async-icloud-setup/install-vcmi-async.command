@@ -11,6 +11,7 @@ echo
 
 INSTALLER_DIR="${0:A:h}"
 AGENT_SOURCE="$INSTALLER_DIR/vcmi-async.zsh"
+LAUNCHER_INSTALLER="$INSTALLER_DIR/launcher/install.zsh"
 CONFIG_DIR="$HOME/Library/Application Support/VCMIAsync"
 SCRIPT_PATH="$CONFIG_DIR/vcmi-async.zsh"
 CONFIG_PATH="$CONFIG_DIR/config.zsh"
@@ -26,6 +27,10 @@ if [[ ! -f "$AGENT_SOURCE" ]]; then
 fi
 if ! /bin/zsh -n "$AGENT_SOURCE"; then
   echo "vcmi-async.zsh містить синтаксичну помилку"
+  exit 1
+fi
+if [[ ! -f "$LAUNCHER_INSTALLER" ]] || ! /bin/zsh -n "$LAUNCHER_INSTALLER"; then
+  echo "Не знайдено коректний launcher/install.zsh"
   exit 1
 fi
 
@@ -142,6 +147,17 @@ EOF
 chmod 600 "$CONFIG_PATH"
 
 /usr/bin/install -m 700 "$AGENT_SOURCE" "$SCRIPT_PATH"
+
+echo
+echo "Встановлюю launcher у список програм macOS."
+INSTALLED_LAUNCHER="$(/bin/zsh "$LAUNCHER_INSTALLER")"
+LAUNCHER_EXECUTABLE="$INSTALLED_LAUNCHER/Contents/MacOS/vcmi-async-launcher"
+echo "Launcher: $INSTALLED_LAUNCHER"
+
+if ! "$LAUNCHER_EXECUTABLE" --request-notifications; then
+  echo "УВАГА: Notifications не дозволені. Увімкни їх для «Грати VCMI Async» у System Settings."
+fi
+"$LAUNCHER_EXECUTABLE" --request-accessibility >/dev/null 2>&1 || true
 
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

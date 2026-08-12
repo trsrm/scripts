@@ -75,7 +75,7 @@ Preserve coverage for:
 2. First changed observation creates pending state; the second publishes.
 3. A save that changes again while pending is not published early.
 4. Publishing replaces the one stable outgoing ZIP.
-5. A valid incoming ZIP is imported with a backup and notification.
+5. A valid incoming ZIP is imported with a backup and actionable turn-ready notification; the notification is emitted only after import state is durable.
 6. An imported save is not sent back.
 7. The same incoming ZIP is ignored without another backup or notification.
 8. A corrupt or unexpected ZIP leaves the local save untouched and is retryable.
@@ -88,6 +88,8 @@ Preserve coverage for:
 15. Invalid configuration fails before touching saves or transport.
 16. A recipient ZIP for another ID raises a deduplicated identity alert, is not
     imported, and imports normally after `SELF_ID` is corrected.
+17. The launcher installer verifies and installs the signed app into the local
+    Applications directory through the same main installation flow.
 
 Add a regression scenario before fixing a newly discovered bug.
 
