@@ -210,8 +210,8 @@ echo
 echo "macOS може один раз попросити дозволити фоновому агенту керувати Finder."
 echo "Натисни Allow — цей постійний дозвіл потрібен для обміну через iCloud."
 /bin/launchctl bootout "gui/$(id -u)/dev.romaniv.vcmi-async" 2>/dev/null || true
-/bin/launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 /bin/launchctl enable "gui/$(id -u)/dev.romaniv.vcmi-async"
+/bin/launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 /bin/launchctl kickstart -k "gui/$(id -u)/dev.romaniv.vcmi-async"
 
 for _ in {1..35}; do
