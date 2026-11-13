@@ -20,11 +20,6 @@ if [[ ! -d "$SOURCE_APP" ]]; then
   print -u2 -r -- "Не знайдено готовий launcher: $SOURCE_APP"
   exit 1
 fi
-if ! /usr/bin/codesign --verify --deep --strict "$SOURCE_APP"; then
-  print -u2 -r -- "Підпис готового launcher пошкоджений"
-  exit 1
-fi
-
 if [[ -x "$LSREGISTER" ]]; then
   "$LSREGISTER" -u "$SOURCE_APP" >/dev/null 2>&1 || true
   [[ -e "$LEGACY_APP_PATH" || -L "$LEGACY_APP_PATH" ]] && \
@@ -38,7 +33,11 @@ fi
 STAGING_ROOT="$(/usr/bin/mktemp -d "$APPLICATIONS_DIR/.vcmi-async-launcher.XXXXXX")"
 STAGED_APP="$STAGING_ROOT/$APP_NAME"
 /usr/bin/ditto "$SOURCE_APP" "$STAGED_APP"
-/usr/bin/codesign --verify --deep --strict "$STAGED_APP"
+/usr/bin/xattr -cr "$STAGED_APP"
+if ! /usr/bin/codesign --verify --deep --strict "$STAGED_APP"; then
+  print -u2 -r -- "Підпис готового launcher пошкоджений"
+  exit 1
+fi
 
 if [[ -e "$BACKUP_APP" || -L "$BACKUP_APP" ]]; then
   /bin/rm -rf "$BACKUP_APP"
