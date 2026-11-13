@@ -212,6 +212,26 @@ check "installer syntax" /bin/zsh -n "$INSTALLER"
 check "launcher installer syntax" /bin/zsh -n "$LAUNCHER_INSTALLER"
 check "main installer installs launcher" \
   /usr/bin/grep -q 'launcher/install.zsh' "$INSTALLER"
+METADATA_LAUNCHER_DIR="$TEST_ROOT/launcher-with-metadata"
+METADATA_LAUNCHER_INSTALLER="$METADATA_LAUNCHER_DIR/install.zsh"
+METADATA_SOURCE_APP="$METADATA_LAUNCHER_DIR/Грати VCMI Async.app"
+METADATA_APPLICATIONS_DIR="$TEST_ROOT/Applications-with-metadata"
+/bin/mkdir -p "$METADATA_LAUNCHER_DIR"
+/bin/cp "$LAUNCHER_INSTALLER" "$METADATA_LAUNCHER_INSTALLER"
+/usr/bin/ditto "$ROOT_DIR/launcher/Грати VCMI Async.app" "$METADATA_SOURCE_APP"
+/usr/bin/xattr -wx com.apple.FinderInfo \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$METADATA_SOURCE_APP"
+METADATA_SOURCE_FINDER_INFO="$(/usr/bin/xattr -px com.apple.FinderInfo "$METADATA_SOURCE_APP")"
+check "launcher installs with source Finder metadata" env \
+  VCMI_ASYNC_APPLICATIONS_DIR="$METADATA_APPLICATIONS_DIR" \
+  VCMI_ASYNC_LEGACY_APP_PATH="$TEST_ROOT/metadata-legacy.app" \
+  /bin/zsh "$METADATA_LAUNCHER_INSTALLER"
+check "metadata launcher signature is valid" /usr/bin/codesign \
+  --verify --deep --strict "$METADATA_APPLICATIONS_DIR/Грати VCMI Async.app"
+check "source Finder metadata remains unchanged" test \
+  "$METADATA_SOURCE_FINDER_INFO" = \
+  "$(/usr/bin/xattr -px com.apple.FinderInfo "$METADATA_SOURCE_APP")"
 TEST_APPLICATIONS_DIR="$TEST_ROOT/Applications"
 TEST_LEGACY_LAUNCHER="$TEST_ROOT/legacy/Грати VCMI Async.app"
 /bin/mkdir -p "${TEST_LEGACY_LAUNCHER:h}"
